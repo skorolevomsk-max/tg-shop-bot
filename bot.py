@@ -69,7 +69,14 @@ CRYPTO_PAY_BASE = (
     "https://testnet-pay.crypt.bot/api" if CRYPTO_PAY_TESTNET else "https://pay.crypt.bot/api"
 )
 
-DB_PATH = os.getenv("DB_PATH", "shop.db")
+def _default_db_path() -> str:
+    # На Fly.io подключаем persistent volume в /data; если каталог есть — кладём БД туда.
+    if os.path.isdir("/data"):
+        return "/data/shop.db"
+    return "shop.db"
+
+
+DB_PATH = os.getenv("DB_PATH") or _default_db_path()
 
 DEFAULT_COMMISSION_PERCENT = 10  # комиссия на вывод по умолчанию, % (меняется в админке)
 
