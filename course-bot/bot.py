@@ -275,6 +275,18 @@ CREATE TABLE IF NOT EXISTS certificates (
     issued_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (user_id, course_id)
 );
+
+CREATE TABLE IF NOT EXISTS news (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    title           TEXT    NOT NULL,
+    body            TEXT    NOT NULL DEFAULT '',
+    media_type      TEXT,                                -- photo/video/animation/document
+    media_file_id   TEXT,
+    is_published    INTEGER NOT NULL DEFAULT 0,
+    is_pinned       INTEGER NOT NULL DEFAULT 0,
+    broadcast_done  INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -731,6 +743,13 @@ class HomeworkSG(StatesGroup):
     content = State()
 
 
+class NewsSG(StatesGroup):
+    title = State()
+    body = State()
+    media = State()
+    edit_value = State()
+
+
 # --------------------------------------------------------------------------- #
 # Клавиатуры
 # --------------------------------------------------------------------------- #
@@ -739,11 +758,12 @@ def kb_main(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📚 Каталог курсов", callback_data="catalog:0")
     b.button(text="🎓 Мои курсы", callback_data="my_courses")
+    b.button(text="📰 Новости", callback_data="news:0")
     b.button(text="👤 Профиль", callback_data="profile")
     b.button(text="🎁 Реф. программа", callback_data="ref")
     if is_admin_user:
         b.button(text="🛠 Админ-панель", callback_data="admin:menu")
-    b.adjust(2, 2, 1)
+    b.adjust(2, 1, 2, 1)
     return b.as_markup()
 
 
@@ -771,8 +791,9 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🏫 Название школы", callback_data="admin:school")
     b.button(text="📥 Экспорт CSV", callback_data="admin:export")
     b.button(text="💾 Бэкап БД", callback_data="admin:backup")
+    b.button(text="📰 Новости", callback_data="admin:news:0")
     b.button(text="⬅️ В меню", callback_data="main")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -4302,6 +4323,585 @@ async def admin_school_set(m: Message, state: FSMContext) -> None:
     await setting_set("school_name", name)
     await m.answer(f"✅ Название школы: <b>{esc(name)}</b>",
                    reply_markup=kb_back("admin:menu"))
+
+
+# --------------------------------------------------------------------------- #
+# 📰 Новости
+# --------------------------------------------------------------------------- #
+
+NEWS_PAGE = 5
+
+
+def _news_media_kinds() -> set[str]:
+    return {"photo", "video", "animation", "document"}
+
+
+async def _send_news_post(chat_id: int, item: aiosqlite.Row,
+                          reply_markup: Optional[InlineKeyboardMarkup] = None,
+                          ) -> None:
+    """Отправляет один пост (текст + опц. медиа) — пользователю или админу."""
+    pin = "📌 " if item["is_pinned"] else ""
+    header = f"<b>{pin}{esc(item['title'])}</b>"
+    body = esc(item["body"]) if item["body"] else ""
+    full_text = (header + ("\n\n" + body if body else "")).strip()
+    media_type = item["media_type"]
+    file_id = item["media_file_id"]
+    if media_type and file_id:
+        caption = full_text[:1024]
+        try:
+            if media_type == "photo":
+                await bot.send_photo(chat_id, file_id, caption=caption,
+                                     reply_markup=reply_markup)
+            elif media_type == "video":
+                await bot.send_video(chat_id, file_id, caption=caption,
+                                     reply_markup=reply_markup)
+            elif media_type == "animation":
+                await bot.send_animation(chat_id, file_id, caption=caption,
+                                         reply_markup=reply_markup)
+            elif media_type == "document":
+                await bot.send_document(chat_id, file_id, caption=caption,
+                                        reply_markup=reply_markup)
+            else:
+                await bot.send_message(chat_id, full_text, reply_markup=reply_markup)
+            return
+        except TelegramAPIError:
+            # fallback: текст + ссылка обратно
+            pass
+    await bot.send_message(chat_id, full_text or "—", reply_markup=reply_markup)
+
+
+# --- Пользовательская лента --- #
+
+@router.callback_query(F.data.startswith("news:"))
+async def cb_news_user(c: CallbackQuery) -> None:
+    parts = c.data.split(":")
+    if len(parts) >= 3 and parts[1] == "view":
+        await _user_news_view(c, int(parts[2]))
+        return
+    page = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        total = (await (await conn.execute(
+            "SELECT COUNT(*) AS c FROM news WHERE is_published = 1"
+        )).fetchone())["c"]
+        rows = await (await conn.execute(
+            "SELECT id, title, is_pinned, created_at FROM news "
+            "WHERE is_published = 1 "
+            "ORDER BY is_pinned DESC, id DESC "
+            "LIMIT ? OFFSET ?",
+            (NEWS_PAGE, page * NEWS_PAGE),
+        )).fetchall()
+    if total == 0:
+        with suppress(TelegramAPIError):
+            await c.message.edit_text(
+                "<b>📰 Новости</b>\n\nПока тут пусто. Загляните позже.",
+                reply_markup=kb_back("main"),
+            )
+        await c.answer()
+        return
+    lines = ["<b>📰 Новости</b>", ""]
+    b = InlineKeyboardBuilder()
+    for r in rows:
+        prefix = "📌 " if r["is_pinned"] else ""
+        date = (r["created_at"] or "")[:10]
+        lines.append(f"• {prefix}<b>{esc(r['title'])}</b> — <i>{esc(date)}</i>")
+        b.button(
+            text=f"{prefix}{r['title'][:36]}",
+            callback_data=f"news:view:{r['id']}",
+        )
+    b.adjust(1)
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️", callback_data=f"news:{page-1}")
+    if (page + 1) * NEWS_PAGE < total:
+        nav.button(text="➡️", callback_data=f"news:{page+1}")
+    nav.adjust(2)
+    b.attach(nav)
+    tail = InlineKeyboardBuilder()
+    tail.button(text="⬅️ В меню", callback_data="main")
+    tail.adjust(1)
+    b.attach(tail)
+    with suppress(TelegramAPIError):
+        await c.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+    await c.answer()
+
+
+async def _user_news_view(c: CallbackQuery, news_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        item = await (await conn.execute(
+            "SELECT * FROM news WHERE id = ? AND is_published = 1", (news_id,)
+        )).fetchone()
+    if not item:
+        await c.answer("Новость не найдена или снята с публикации", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К списку", callback_data="news:0")
+    b.adjust(1)
+    await _send_news_post(c.from_user.id, item, reply_markup=b.as_markup())
+    await c.answer()
+
+
+# --- Админ-CRUD --- #
+
+@router.callback_query(F.data.startswith("admin:news:"))
+async def cb_admin_news_list(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    await state.clear()
+    page = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        total = (await (await conn.execute(
+            "SELECT COUNT(*) AS c FROM news"
+        )).fetchone())["c"]
+        rows = await (await conn.execute(
+            "SELECT id, title, is_published, is_pinned, broadcast_done, created_at "
+            "FROM news ORDER BY is_pinned DESC, id DESC LIMIT ? OFFSET ?",
+            (NEWS_PAGE, page * NEWS_PAGE),
+        )).fetchall()
+    text = f"<b>📰 Новости (всего: {total})</b>"
+    b = InlineKeyboardBuilder()
+    if total == 0:
+        text += "\n\nЕщё ничего не добавлено."
+    for r in rows:
+        flags = []
+        if r["is_pinned"]:
+            flags.append("📌")
+        flags.append("🟢" if r["is_published"] else "⚪️")
+        if r["broadcast_done"]:
+            flags.append("📢")
+        b.button(
+            text=f"{''.join(flags)} #{r['id']} {r['title'][:30]}",
+            callback_data=f"admin:news_view:{r['id']}",
+        )
+    b.adjust(1)
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️", callback_data=f"admin:news:{page-1}")
+    if (page + 1) * NEWS_PAGE < total:
+        nav.button(text="➡️", callback_data=f"admin:news:{page+1}")
+    nav.adjust(2)
+    b.attach(nav)
+    tail = InlineKeyboardBuilder()
+    tail.button(text="➕ Новая новость", callback_data="admin:news_new")
+    tail.button(text="⬅️ Админ", callback_data="admin:menu")
+    tail.adjust(1)
+    b.attach(tail)
+    with suppress(TelegramAPIError):
+        await c.message.edit_text(text, reply_markup=b.as_markup())
+    await c.answer()
+
+
+@router.callback_query(F.data == "admin:news_new")
+async def cb_admin_news_new(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    await state.set_state(NewsSG.title)
+    await c.message.edit_text(
+        "<b>📰 Новая новость — 1/3</b>\n\nВведите заголовок (до 120 символов):",
+        reply_markup=kb_back("admin:news:0"),
+    )
+    await c.answer()
+
+
+@router.message(NewsSG.title)
+async def admin_news_title(m: Message, state: FSMContext) -> None:
+    title = (m.text or "").strip()
+    if not title:
+        await m.answer("Заголовок не может быть пустым.")
+        return
+    await state.update_data(title=title[:120])
+    await state.set_state(NewsSG.body)
+    b = InlineKeyboardBuilder()
+    b.button(text="⏭ Пропустить (без текста)", callback_data="admin:news_skip_body")
+    b.button(text="⬅️ Отмена", callback_data="admin:news:0")
+    b.adjust(1)
+    await m.answer(
+        "<b>2/3</b>\n\nПришлите текст новости (HTML поддерживается) "
+        "или нажмите «Пропустить»:",
+        reply_markup=b.as_markup(),
+    )
+
+
+@router.callback_query(NewsSG.body, F.data == "admin:news_skip_body")
+async def cb_admin_news_skip_body(c: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(body="")
+    await _ask_news_media(c.message, state)
+    await c.answer()
+
+
+@router.message(NewsSG.body)
+async def admin_news_body(m: Message, state: FSMContext) -> None:
+    body = (m.html_text or m.text or "").strip()
+    await state.update_data(body=body[:3500])
+    await _ask_news_media(m, state)
+
+
+async def _ask_news_media(target: Message, state: FSMContext) -> None:
+    await state.set_state(NewsSG.media)
+    b = InlineKeyboardBuilder()
+    b.button(text="⏭ Пропустить (без медиа)", callback_data="admin:news_skip_media")
+    b.button(text="⬅️ Отмена", callback_data="admin:news:0")
+    b.adjust(1)
+    await target.answer(
+        "<b>3/3</b>\n\nПришлите фото/видео/GIF/документ (необязательно), "
+        "или «Пропустить»:",
+        reply_markup=b.as_markup(),
+    )
+
+
+@router.callback_query(NewsSG.media, F.data == "admin:news_skip_media")
+async def cb_admin_news_skip_media(c: CallbackQuery, state: FSMContext) -> None:
+    await _save_news(c.from_user.id, state, media_type=None, file_id=None,
+                     reply_target=c.message)
+    await c.answer()
+
+
+@router.message(NewsSG.media)
+async def admin_news_media(m: Message, state: FSMContext) -> None:
+    media_type, file_id = None, None
+    if m.photo:
+        media_type, file_id = "photo", m.photo[-1].file_id
+    elif m.video:
+        media_type, file_id = "video", m.video.file_id
+    elif m.animation:
+        media_type, file_id = "animation", m.animation.file_id
+    elif m.document:
+        media_type, file_id = "document", m.document.file_id
+    else:
+        await m.answer("Поддерживается фото / видео / GIF / документ. "
+                       "Или нажмите «Пропустить» выше.")
+        return
+    await _save_news(m.from_user.id, state, media_type=media_type,
+                     file_id=file_id, reply_target=m)
+
+
+async def _save_news(user_id: int, state: FSMContext, *, media_type: Optional[str],
+                     file_id: Optional[str], reply_target: Message) -> None:
+    data = await state.get_data()
+    await state.clear()
+    title = data.get("title", "Без заголовка")
+    body = data.get("body", "")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "INSERT INTO news(title, body, media_type, media_file_id) "
+            "VALUES (?, ?, ?, ?)",
+            (title, body, media_type, file_id),
+        )
+        await conn.commit()
+        nid = cur.lastrowid
+    b = InlineKeyboardBuilder()
+    b.button(text="🟢 Опубликовать", callback_data=f"admin:news_pub:{nid}")
+    b.button(text="📰 К списку", callback_data="admin:news:0")
+    b.adjust(1)
+    await reply_target.answer(
+        f"✅ Новость #{nid} создана как черновик. Опубликуйте, чтобы она "
+        f"появилась у пользователей.",
+        reply_markup=b.as_markup(),
+    )
+
+
+async def _admin_news_card(news_id: int) -> tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        item = await (await conn.execute(
+            "SELECT * FROM news WHERE id = ?", (news_id,)
+        )).fetchone()
+    if not item:
+        return None, None
+    pub = "🟢 опубликована" if item["is_published"] else "⚪️ черновик"
+    pin = "📌 закреплена" if item["is_pinned"] else ""
+    cast = "📢 разослана" if item["broadcast_done"] else ""
+    media = f"{item['media_type']}" if item["media_type"] else "—"
+    body_preview = (item["body"] or "")[:300]
+    text = (
+        f"<b>📰 #{item['id']} {esc(item['title'])}</b>\n"
+        f"Статус: <b>{pub}</b> {pin} {cast}\n"
+        f"Медиа: <b>{esc(media)}</b>\n"
+        f"Создано: {esc((item['created_at'] or '')[:16])}\n\n"
+        f"{esc(body_preview)}"
+    )
+    b = InlineKeyboardBuilder()
+    if item["is_published"]:
+        b.button(text="⚪️ Снять с публикации",
+                 callback_data=f"admin:news_unpub:{item['id']}")
+    else:
+        b.button(text="🟢 Опубликовать",
+                 callback_data=f"admin:news_pub:{item['id']}")
+    if item["is_pinned"]:
+        b.button(text="📌 Открепить",
+                 callback_data=f"admin:news_unpin:{item['id']}")
+    else:
+        b.button(text="📌 Закрепить",
+                 callback_data=f"admin:news_pin:{item['id']}")
+    b.button(text="✏️ Заголовок", callback_data=f"admin:news_edit:{item['id']}:title")
+    b.button(text="✏️ Текст", callback_data=f"admin:news_edit:{item['id']}:body")
+    b.button(text="👁 Превью",
+             callback_data=f"admin:news_preview:{item['id']}")
+    b.button(text="📢 Разослать всем",
+             callback_data=f"admin:news_cast:{item['id']}")
+    b.button(text="🗑 Удалить",
+             callback_data=f"admin:news_del:{item['id']}")
+    b.button(text="⬅️ К списку", callback_data="admin:news:0")
+    b.adjust(1, 2, 2, 2, 1, 1)
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data.startswith("admin:news_view:"))
+async def cb_admin_news_view(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    text, kb = await _admin_news_card(nid)
+    if not text:
+        await c.answer("Новость не найдена", show_alert=True)
+        return
+    with suppress(TelegramAPIError):
+        await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("admin:news_pub:"))
+async def cb_admin_news_pub(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE news SET is_published = 1 WHERE id = ?", (nid,)
+        )
+        await conn.commit()
+    await c.answer("Опубликовано")
+    await cb_admin_news_view(c)
+
+
+@router.callback_query(F.data.startswith("admin:news_unpub:"))
+async def cb_admin_news_unpub(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE news SET is_published = 0 WHERE id = ?", (nid,)
+        )
+        await conn.commit()
+    await c.answer("Снято с публикации")
+    await cb_admin_news_view(c)
+
+
+@router.callback_query(F.data.startswith("admin:news_pin:"))
+async def cb_admin_news_pin(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("UPDATE news SET is_pinned = 1 WHERE id = ?", (nid,))
+        await conn.commit()
+    await c.answer("Закреплено")
+    await cb_admin_news_view(c)
+
+
+@router.callback_query(F.data.startswith("admin:news_unpin:"))
+async def cb_admin_news_unpin(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("UPDATE news SET is_pinned = 0 WHERE id = ?", (nid,))
+        await conn.commit()
+    await c.answer("Откреплено")
+    await cb_admin_news_view(c)
+
+
+@router.callback_query(F.data.startswith("admin:news_preview:"))
+async def cb_admin_news_preview(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        item = await (await conn.execute(
+            "SELECT * FROM news WHERE id = ?", (nid,)
+        )).fetchone()
+    if not item:
+        await c.answer("Не найдено", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К новости", callback_data=f"admin:news_view:{nid}")
+    b.adjust(1)
+    await _send_news_post(c.from_user.id, item, reply_markup=b.as_markup())
+    await c.answer("Превью отправлено")
+
+
+@router.callback_query(F.data.startswith("admin:news_del:"))
+async def cb_admin_news_del(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    parts = c.data.split(":")
+    nid = int(parts[2])
+    if len(parts) >= 4 and parts[3] == "yes":
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute("DELETE FROM news WHERE id = ?", (nid,))
+            await conn.commit()
+        await c.answer("Удалено")
+        # вернуться к списку
+        c.data = "admin:news:0"
+        # FSM не задействован
+        from aiogram.fsm.context import FSMContext as _FSM  # noqa: F401
+        # пересобрать список вручную: используем edit_text
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            total = (await (await conn.execute(
+                "SELECT COUNT(*) AS c FROM news"
+            )).fetchone())["c"]
+            rows = await (await conn.execute(
+                "SELECT id, title, is_published, is_pinned, broadcast_done "
+                "FROM news ORDER BY is_pinned DESC, id DESC LIMIT ?",
+                (NEWS_PAGE,),
+            )).fetchall()
+        text = f"<b>📰 Новости (всего: {total})</b>"
+        if total == 0:
+            text += "\n\nЕщё ничего не добавлено."
+        b = InlineKeyboardBuilder()
+        for r in rows:
+            flags = []
+            if r["is_pinned"]:
+                flags.append("📌")
+            flags.append("🟢" if r["is_published"] else "⚪️")
+            if r["broadcast_done"]:
+                flags.append("📢")
+            b.button(
+                text=f"{''.join(flags)} #{r['id']} {r['title'][:30]}",
+                callback_data=f"admin:news_view:{r['id']}",
+            )
+        b.adjust(1)
+        tail = InlineKeyboardBuilder()
+        tail.button(text="➕ Новая новость", callback_data="admin:news_new")
+        tail.button(text="⬅️ Админ", callback_data="admin:menu")
+        tail.adjust(1)
+        b.attach(tail)
+        with suppress(TelegramAPIError):
+            await c.message.edit_text(text, reply_markup=b.as_markup())
+        return
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Да, удалить", callback_data=f"admin:news_del:{nid}:yes")
+    b.button(text="Отмена", callback_data=f"admin:news_view:{nid}")
+    b.adjust(1)
+    with suppress(TelegramAPIError):
+        await c.message.edit_text(
+            f"Удалить новость #{nid}? Это действие необратимо.",
+            reply_markup=b.as_markup(),
+        )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("admin:news_edit:"))
+async def cb_admin_news_edit(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    _, _, nid_raw, field = c.data.split(":")
+    nid = int(nid_raw)
+    if field not in ("title", "body"):
+        await c.answer("Поле недоступно", show_alert=True)
+        return
+    await state.set_state(NewsSG.edit_value)
+    await state.update_data(news_id=nid, field=field)
+    await c.message.edit_text(
+        f"Введите новое значение для <b>{esc(field)}</b>:",
+        reply_markup=kb_back(f"admin:news_view:{nid}"),
+    )
+    await c.answer()
+
+
+@router.message(NewsSG.edit_value)
+async def admin_news_edit_value(m: Message, state: FSMContext) -> None:
+    if not is_admin(m.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    nid = int(data.get("news_id", 0))
+    field = data.get("field", "")
+    if field == "title":
+        value = (m.text or "").strip()[:120]
+        if not value:
+            await m.answer("Пусто.")
+            return
+    elif field == "body":
+        value = (m.html_text or m.text or "").strip()[:3500]
+    else:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            f"UPDATE news SET {field} = ? WHERE id = ?", (value, nid)
+        )
+        await conn.commit()
+    text, kb = await _admin_news_card(nid)
+    if text:
+        await m.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("admin:news_cast:"))
+async def cb_admin_news_cast(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    nid = int(c.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        item = await (await conn.execute(
+            "SELECT * FROM news WHERE id = ?", (nid,)
+        )).fetchone()
+        if not item:
+            await c.answer("Не найдено", show_alert=True)
+            return
+        if not item["is_published"]:
+            await c.answer("Сначала опубликуйте новость", show_alert=True)
+            return
+        users = await (await conn.execute(
+            "SELECT tg_id FROM users"
+        )).fetchall()
+    await c.answer("Запускаю рассылку…")
+    with suppress(TelegramAPIError):
+        await c.message.edit_text(
+            f"📢 Рассылка новости <b>#{nid}</b> по <b>{len(users)}</b> "
+            f"пользователям. Это займёт ~{len(users) * 0.05:.0f} с.",
+            reply_markup=None,
+        )
+    asyncio.create_task(_run_news_broadcast(c.from_user.id, dict(item),
+                                            [int(u["tg_id"]) for u in users]))
+
+
+async def _run_news_broadcast(admin_id: int, item: dict,
+                              uids: list[int]) -> None:
+    sent, blocked, failed = 0, 0, 0
+    # обернуть item в подобие Row через простой объект
+    class _Row(dict):
+        def __getitem__(self, k):  # type: ignore[override]
+            return dict.__getitem__(self, k)
+    row = _Row(item)
+    for uid in uids:
+        try:
+            await _send_news_post(uid, row, reply_markup=None)
+            sent += 1
+        except TelegramForbiddenError:
+            blocked += 1
+        except TelegramAPIError:
+            failed += 1
+        await asyncio.sleep(0.05)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE news SET broadcast_done = 1 WHERE id = ?", (item["id"],)
+        )
+        await conn.commit()
+    with suppress(TelegramAPIError):
+        await bot.send_message(
+            admin_id,
+            f"📢 Рассылка новости #{item['id']} завершена.\n"
+            f"Доставлено: <b>{sent}</b>, заблокировали бот: <b>{blocked}</b>, "
+            f"ошибок: <b>{failed}</b>.",
+            reply_markup=kb_back("admin:news:0"),
+        )
 
 
 # --------------------------------------------------------------------------- #
