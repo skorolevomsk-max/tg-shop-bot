@@ -1,8 +1,17 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
 .env
 shop.db
+*.db
 *.db-journal
 *.sqlite
 .DS_Store
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+storage/
