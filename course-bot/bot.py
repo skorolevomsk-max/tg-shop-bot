@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import datetime as dt
 import html
 import io
@@ -768,8 +769,10 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="💵 Выдать баланс", callback_data="admin:give")
     b.button(text="📝 Приветствие", callback_data="admin:welcome")
     b.button(text="🏫 Название школы", callback_data="admin:school")
+    b.button(text="📥 Экспорт CSV", callback_data="admin:export")
+    b.button(text="💾 Бэкап БД", callback_data="admin:backup")
     b.button(text="⬅️ В меню", callback_data="main")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -1656,8 +1659,8 @@ async def _finalize_purchase(deposit_id: int) -> None:
                     f"за покупку вашего приглашённого.",
                 )
 
+    course = await _get_course(int(dep["course_id"]))
     with suppress(TelegramAPIError):
-        course = await _get_course(int(dep["course_id"]))
         await bot.send_message(
             int(dep["user_id"]),
             f"✅ Оплата подтверждена! Курс <b>{esc(course['title'] if course else '')}</b> "
@@ -1665,8 +1668,54 @@ async def _finalize_purchase(deposit_id: int) -> None:
             reply_markup=kb_back("main"),
         )
 
+    # уведомление администратора(ов) о каждой успешной оплате
+    await _notify_admins_purchase(
+        user_id=int(dep["user_id"]),
+        course_title=(course["title"] if course else f"#{dep['course_id']}"),
+        amount_kop=int(dep["amount"]),
+        method=str(dep["method"]),
+        promo_code=dep["promo_code"],
+    )
+
     # пост-покупка: выдать invite в закрытый чат курса, если настроен
     await _post_purchase_actions(int(dep["user_id"]), int(dep["course_id"]))
+
+
+_METHOD_LABELS = {
+    "manual": "💳 Перевод на карту",
+    "crypto": "🤖 CryptoBot",
+    "yookassa": "🏦 YooKassa",
+    "stars": "⭐️ Telegram Stars",
+    "balance": "💼 С баланса",
+    "admin_grant": "👤 Выдан админом",
+}
+
+
+async def _notify_admins_purchase(*, user_id: int, course_title: str,
+                                  amount_kop: int, method: str,
+                                  promo_code: Optional[str]) -> None:
+    if not ADMIN_IDS:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        u = await (await conn.execute(
+            "SELECT username, full_name FROM users WHERE tg_id = ?", (user_id,)
+        )).fetchone()
+    name = (u["full_name"] if u and u["full_name"] else f"#{user_id}")
+    uname = f"@{u['username']}" if u and u["username"] else ""
+    method_label = _METHOD_LABELS.get(method, method)
+    promo_line = f"\n🏷 Промокод: <code>{esc(promo_code)}</code>" if promo_code else ""
+    text = (
+        "💰 <b>Новая оплата</b>\n"
+        f"👤 {esc(name)} {esc(uname)} (<code>{user_id}</code>)\n"
+        f"📚 Курс: <b>{esc(course_title)}</b>\n"
+        f"💵 Сумма: <b>{rub(amount_kop)}</b>\n"
+        f"💳 Метод: {method_label}"
+        f"{promo_line}"
+    )
+    for aid in ADMIN_IDS:
+        with suppress(TelegramAPIError):
+            await bot.send_message(aid, text)
 
 
 async def _post_purchase_actions(user_id: int, course_id: int) -> None:
@@ -1914,6 +1963,174 @@ async def cb_admin_menu(c: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await c.message.edit_text("<b>🛠 Админ-панель</b>", reply_markup=kb_admin_menu())
     await c.answer()
+
+
+# --- Ученики курса (с прогрессом) --- #
+
+@router.callback_query(F.data.startswith("admin:students:"))
+async def cb_admin_students(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    parts = c.data.split(":")
+    cid = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        course = await (await conn.execute(
+            "SELECT title FROM courses WHERE id = ?", (cid,)
+        )).fetchone()
+        total_lessons = (await (await conn.execute(
+            "SELECT COUNT(*) AS c FROM lessons WHERE course_id = ?", (cid,)
+        )).fetchone())["c"]
+        total = (await (await conn.execute(
+            "SELECT COUNT(*) AS c FROM purchases WHERE course_id = ?", (cid,)
+        )).fetchone())["c"]
+        rows = await (await conn.execute(
+            "SELECT p.user_id, p.created_at, p.price, "
+            "       u.username, u.full_name "
+            "FROM purchases p LEFT JOIN users u ON u.tg_id = p.user_id "
+            "WHERE p.course_id = ? "
+            "ORDER BY p.created_at DESC LIMIT ? OFFSET ?",
+            (cid, PAGE_SIZE, page * PAGE_SIZE),
+        )).fetchall()
+        # прогресс по уроки этого курса для каждого ученика — одним запросом
+        done_map: dict[int, int] = {}
+        if rows:
+            uids = [int(r["user_id"]) for r in rows]
+            placeholders = ",".join(["?"] * len(uids))
+            done_rows = await (await conn.execute(
+                f"SELECT lp.user_id, COUNT(*) AS c "
+                f"FROM lesson_progress lp "
+                f"JOIN lessons l ON l.id = lp.lesson_id "
+                f"WHERE l.course_id = ? AND lp.user_id IN ({placeholders}) "
+                f"GROUP BY lp.user_id",
+                (cid, *uids),
+            )).fetchall()
+            done_map = {int(r["user_id"]): int(r["c"]) for r in done_rows}
+
+    if not course:
+        await c.answer("Курс не найден", show_alert=True)
+        return
+    title = esc(course["title"])
+    if total == 0:
+        text = f"<b>👥 Ученики курса «{title}»</b>\n\nЕщё никто не купил."
+    else:
+        lines = [f"<b>👥 Ученики курса «{title}»</b>",
+                 f"Всего: <b>{total}</b>, уроков: <b>{total_lessons}</b>\n"]
+        for r in rows:
+            uid = int(r["user_id"])
+            done = done_map.get(uid, 0)
+            pct = (100 * done // total_lessons) if total_lessons else 0
+            name = r["full_name"] or (f"@{r['username']}" if r["username"]
+                                      else f"#{uid}")
+            uname = f" @{r['username']}" if r["username"] and r["full_name"] else ""
+            created = (r["created_at"] or "")[:16].replace("T", " ")
+            lines.append(
+                f"• <b>{esc(name)}</b>{esc(uname)} (<code>{uid}</code>) — "
+                f"{done}/{total_lessons} ({pct}%) — {esc(created)}"
+            )
+        text = "\n".join(lines)
+
+    b = InlineKeyboardBuilder()
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️", callback_data=f"admin:students:{cid}:{page-1}")
+    if (page + 1) * PAGE_SIZE < total:
+        nav.button(text="➡️", callback_data=f"admin:students:{cid}:{page+1}")
+    nav.adjust(2)
+    b.attach(nav)
+    tail = InlineKeyboardBuilder()
+    tail.button(text="⬅️ К курсу", callback_data=f"admin:course:{cid}")
+    tail.adjust(1)
+    b.attach(tail)
+    with suppress(TelegramAPIError):
+        await c.message.edit_text(text, reply_markup=b.as_markup())
+    await c.answer()
+
+
+# --- CSV-экспорт продаж --- #
+
+@router.callback_query(F.data == "admin:export")
+async def cb_admin_export(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    await c.answer("Готовлю CSV…")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute(
+            "SELECT p.id, p.created_at, p.user_id, "
+            "       u.username, u.full_name, "
+            "       p.course_id, c.title AS course_title, "
+            "       p.price, p.method, p.promo_code "
+            "FROM purchases p "
+            "LEFT JOIN users   u ON u.tg_id = p.user_id "
+            "LEFT JOIN courses c ON c.id    = p.course_id "
+            "ORDER BY p.created_at DESC"
+        )).fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow([
+        "id", "created_at", "user_id", "username", "full_name",
+        "course_id", "course_title", "price_rub", "method", "promo_code",
+    ])
+    for r in rows:
+        price_rub = f"{int(r['price']) / 100:.2f}".replace(".", ",")
+        w.writerow([
+            r["id"], r["created_at"], r["user_id"],
+            r["username"] or "", r["full_name"] or "",
+            r["course_id"], r["course_title"] or "",
+            price_rub, r["method"], r["promo_code"] or "",
+        ])
+    data = buf.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel/Numbers корректно открыл
+    fname = f"purchases-{dt.datetime.now().strftime('%Y%m%d-%H%M')}.csv"
+    with suppress(TelegramAPIError):
+        await bot.send_document(
+            c.from_user.id,
+            BufferedInputFile(data, filename=fname),
+            caption=(
+                f"📥 Экспорт продаж — <b>{len(rows)}</b> строк.\n"
+                f"Разделитель «;», кодировка UTF-8 BOM."
+            ),
+        )
+
+
+# --- Бэкап БД --- #
+
+@router.callback_query(F.data == "admin:backup")
+async def cb_admin_backup(c: CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        return
+    await c.answer("Делаю бэкап…")
+    if not os.path.exists(DB_PATH):
+        with suppress(TelegramAPIError):
+            await bot.send_message(c.from_user.id, "❌ Файл БД не найден")
+        return
+    # SQLite VACUUM INTO даёт целостный snapshot без блокировки записи
+    bkp_dir = os.path.dirname(DB_PATH) or "."
+    bkp_path = os.path.join(
+        bkp_dir, f"course-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+    )
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute(f"VACUUM INTO '{bkp_path}'")
+        with open(bkp_path, "rb") as fh:
+            data = fh.read()
+        size_mb = len(data) / 1024 / 1024
+        with suppress(TelegramAPIError):
+            await bot.send_document(
+                c.from_user.id,
+                BufferedInputFile(data, filename=os.path.basename(bkp_path)),
+                caption=f"💾 Бэкап БД ({size_mb:.2f} MiB)",
+            )
+    except Exception as e:
+        log.exception("backup failed")
+        with suppress(TelegramAPIError):
+            await bot.send_message(c.from_user.id, f"❌ Ошибка бэкапа: {esc(str(e))}")
+    finally:
+        with suppress(Exception):
+            if os.path.exists(bkp_path):
+                os.remove(bkp_path)
 
 
 # --- Статистика --- #
@@ -2360,9 +2577,10 @@ async def _course_admin_card(cid: int) -> tuple[Optional[str], Optional[InlineKe
     b.button(text="➕ Добавить урок", callback_data=f"admin:lesson_new:{cid}")
     if lessons:
         b.button(text="📋 Уроки", callback_data=f"admin:lessons:{cid}")
+    b.button(text="👥 Ученики", callback_data=f"admin:students:{cid}:0")
     b.button(text="🗑 Удалить курс", callback_data=f"admin:course_del:{cid}")
     b.button(text="⬅️ К списку", callback_data="admin:courses:0")
-    b.adjust(1, 2, 2, 2, 2, 1)
+    b.adjust(1, 2, 2, 2, 2, 1, 1)
     return text, b.as_markup()
 
 
@@ -2999,10 +3217,42 @@ async def cb_lesson_done(c: CallbackQuery) -> None:
             return
     await mark_lesson_completed(c.from_user.id, lid)
     await c.answer("✅ Урок отмечен пройденным")
-    # проверка: все уроки пройдены → сразу шлём сертификат
+
+    # ищем следующий урок в этом курсе (по position, затем по id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        nxt = await (await conn.execute(
+            "SELECT id, title FROM lessons WHERE course_id = ? "
+            "AND (position > ? OR (position = ? AND id > ?)) "
+            "ORDER BY position ASC, id ASC LIMIT 1",
+            (lesson["course_id"], lesson["position"], lesson["position"], lid),
+        )).fetchone()
+
     done, total = await course_progress(c.from_user.id, lesson["course_id"])
     if total and done >= total:
         await _send_certificate(c.from_user.id, lesson["course_id"])
+        with suppress(TelegramAPIError):
+            await bot.send_message(
+                c.from_user.id,
+                f"🎉 Курс пройден полностью ({done}/{total})!",
+                reply_markup=kb_back(f"course:{lesson['course_id']}"),
+            )
+        return
+
+    b = InlineKeyboardBuilder()
+    if nxt:
+        b.button(
+            text=f"▶️ Следующий: {nxt['title'][:30]}",
+            callback_data=f"lesson:{nxt['id']}",
+        )
+    b.button(text="⬅️ К курсу", callback_data=f"course:{lesson['course_id']}")
+    b.adjust(1)
+    with suppress(TelegramAPIError):
+        await bot.send_message(
+            c.from_user.id,
+            f"Прогресс: <b>{done}/{total}</b> уроков пройдено.",
+            reply_markup=b.as_markup(),
+        )
 
 
 async def _send_certificate(user_id: int, course_id: int) -> None:
