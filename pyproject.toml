@@ -1,0 +1,24 @@
+[project]
+name = "tg-shop-bot"
+version = "0.2.0"
+description = "Telegram bot for selling digital goods (keys, files, texts, subscriptions). aiogram 3, SQLAlchemy, multiple payment providers."
+requires-python = ">=3.10"
+dependencies = [
+    "aiogram==3.26.0",
+    "python-dotenv>=1.0.1",
+    "aiohttp>=3.9.0",
+    "SQLAlchemy>=2.0.30",
+    "aiosqlite>=0.20.0",
+    "pydantic>=2.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
