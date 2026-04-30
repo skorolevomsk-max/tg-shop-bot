@@ -931,22 +931,11 @@ async def _show_feed(target: Message, user_id: int, idx: int, *,
     if idx > 0:
         b.button(text="◀️ Назад", callback_data=f"feed:{idx-1}")
 
-    # основное меню (всегда видно)
-    b.button(text="📚 Каталог курсов", callback_data="catalog:0")
-    b.button(text="🎓 Мои курсы", callback_data="my_courses")
-    b.button(text="📰 Все новости", callback_data="news:0")
-    b.button(text="👤 Профиль", callback_data="profile")
-    b.button(text="🎁 Реф. программа", callback_data="ref")
-    if is_admin_user:
-        b.button(text="🛠 Админ-панель", callback_data="admin:menu")
-
-    # компоновка
-    if total > 0 and idx + 1 < total and idx > 0:
-        b.adjust(2, 2, 2, 2, 1)
-    elif total > 0 and (idx + 1 < total or idx > 0):
-        b.adjust(1, 2, 2, 2, 1)
+    # компоновка: «Дальше» сверху, «Назад» под ней
+    if total > 0 and idx > 0:
+        b.adjust(1, 1)
     else:
-        b.adjust(1, 2, 2, 2, 1) if total > 0 else b.adjust(2, 2, 2, 1)
+        b.adjust(1)
 
     kb = b.as_markup()
 
