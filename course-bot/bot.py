@@ -855,16 +855,14 @@ async def cmd_start_deep(m: Message, command: CommandObject, state: FSMContext) 
         except ValueError:
             pass
     await ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name, referrer_id)
-    welcome = await setting_get("welcome_text", "Привет!")
-    await m.answer(welcome, reply_markup=kb_main(is_admin(m.from_user.id)))
+    await _show_feed(m, m.from_user.id, 0, edit=False)
 
 
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext) -> None:
     await state.clear()
     await ensure_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-    welcome = await setting_get("welcome_text", "Привет!")
-    await m.answer(welcome, reply_markup=kb_main(is_admin(m.from_user.id)))
+    await _show_feed(m, m.from_user.id, 0, edit=False)
 
 
 @router.message(Command("admin"))
@@ -878,10 +876,241 @@ async def cmd_admin(m: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "main")
 async def cb_main(c: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    welcome = await setting_get("welcome_text", "Привет!")
-    with suppress(TelegramAPIError):
-        await c.message.edit_text(welcome, reply_markup=kb_main(is_admin(c.from_user.id)))
+    await _show_feed(c.message, c.from_user.id, 0, edit=True)
     await c.answer()
+
+
+@router.callback_query(F.data.startswith("feed:"))
+async def cb_feed(c: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        idx = int(c.data.split(":")[1])
+    except (ValueError, IndexError):
+        idx = 0
+    if idx < 0:
+        idx = 0
+    await _show_feed(c.message, c.from_user.id, idx, edit=True)
+    await c.answer()
+
+
+async def _show_feed(target: Message, user_id: int, idx: int, *,
+                     edit: bool) -> None:
+    """Главный экран: показываем новость #idx (0 = самая свежая) с навигацией.
+
+    После последней новости (idx >= total) рендерим экран продажи featured-курса.
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        total = (await (await conn.execute(
+            "SELECT COUNT(*) AS c FROM news WHERE is_published = 1"
+        )).fetchone())["c"]
+        item = None
+        if total > 0 and idx < total:
+            item = await (await conn.execute(
+                "SELECT * FROM news WHERE is_published = 1 "
+                "ORDER BY is_pinned DESC, id DESC LIMIT 1 OFFSET ?",
+                (idx,),
+            )).fetchone()
+
+    is_admin_user = is_admin(user_id)
+
+    # ----- экран продажи курса (последний шаг ленты) -----
+    if total > 0 and idx >= total:
+        await _show_pitch(target, user_id, prev_feed_idx=total - 1, edit=edit)
+        return
+
+    b = InlineKeyboardBuilder()
+
+    # «Дальше» — переход на следующую новость, либо на продающий экран курса
+    if total > 0 and idx + 1 < total:
+        b.button(text="▶️ Дальше", callback_data=f"feed:{idx+1}")
+    elif total > 0:
+        b.button(text="🚀 Дальше — выбрать курс", callback_data=f"feed:{total}")
+
+    # «Назад» — к более свежей новости
+    if idx > 0:
+        b.button(text="◀️ Назад", callback_data=f"feed:{idx-1}")
+
+    # основное меню (всегда видно)
+    b.button(text="📚 Каталог курсов", callback_data="catalog:0")
+    b.button(text="🎓 Мои курсы", callback_data="my_courses")
+    b.button(text="📰 Все новости", callback_data="news:0")
+    b.button(text="👤 Профиль", callback_data="profile")
+    b.button(text="🎁 Реф. программа", callback_data="ref")
+    if is_admin_user:
+        b.button(text="🛠 Админ-панель", callback_data="admin:menu")
+
+    # компоновка
+    if total > 0 and idx + 1 < total and idx > 0:
+        b.adjust(2, 2, 2, 2, 1)
+    elif total > 0 and (idx + 1 < total or idx > 0):
+        b.adjust(1, 2, 2, 2, 1)
+    else:
+        b.adjust(1, 2, 2, 2, 1) if total > 0 else b.adjust(2, 2, 2, 1)
+
+    kb = b.as_markup()
+
+    # Если новостей нет — fallback: приветствие + меню
+    if not item:
+        welcome = await setting_get(
+            "welcome_text",
+            "👋 Добро пожаловать!\n\nВыбирайте курс и начинайте учиться.",
+        )
+        # Меню без feed-кнопок
+        b2 = InlineKeyboardBuilder()
+        b2.button(text="📚 Каталог курсов", callback_data="catalog:0")
+        b2.button(text="🎓 Мои курсы", callback_data="my_courses")
+        b2.button(text="👤 Профиль", callback_data="profile")
+        b2.button(text="🎁 Реф. программа", callback_data="ref")
+        if is_admin_user:
+            b2.button(text="🛠 Админ-панель", callback_data="admin:menu")
+        b2.adjust(2, 2, 1)
+        kb_no = b2.as_markup()
+        if edit:
+            with suppress(TelegramAPIError):
+                await target.edit_text(welcome, reply_markup=kb_no)
+                return
+            with suppress(TelegramAPIError):
+                await bot.send_message(user_id, welcome, reply_markup=kb_no)
+        else:
+            await target.answer(welcome, reply_markup=kb_no)
+        return
+
+    # рендер новости как «канальный пост»
+    counter = f"  ·  {idx + 1}/{total}"
+    pin = "📌 " if item["is_pinned"] else ""
+    header = f"<b>{pin}{esc(item['title'])}</b>{counter}"
+    body = esc(item["body"]) if item["body"] else ""
+    full_text = (header + ("\n\n" + body if body else "")).strip()
+    media_type = item["media_type"]
+    file_id = item["media_file_id"]
+
+    # Если редактируем существующее сообщение и новый пост без медиа — просто edit_text.
+    # В остальных случаях — удаляем старое и шлём новое (медиа нельзя «вставить» в текст-сообщение).
+    if edit and not (media_type and file_id):
+        with suppress(TelegramAPIError):
+            await target.edit_text(full_text, reply_markup=kb)
+            return
+        # Если редактирование не удалось (напр. прежнее было медиа-сообщением) — fallthrough к send.
+
+    if edit:
+        with suppress(TelegramAPIError):
+            await target.delete()
+
+    caption = full_text[:1024]
+    try:
+        if media_type == "photo" and file_id:
+            await bot.send_photo(user_id, file_id, caption=caption, reply_markup=kb)
+        elif media_type == "video" and file_id:
+            await bot.send_video(user_id, file_id, caption=caption, reply_markup=kb)
+        elif media_type == "animation" and file_id:
+            await bot.send_animation(user_id, file_id, caption=caption, reply_markup=kb)
+        elif media_type == "document" and file_id:
+            await bot.send_document(user_id, file_id, caption=caption, reply_markup=kb)
+        else:
+            await bot.send_message(user_id, full_text, reply_markup=kb)
+    except TelegramAPIError as e:
+        log.warning("feed render failed: %s", e)
+        with suppress(TelegramAPIError):
+            await bot.send_message(user_id, full_text, reply_markup=kb)
+
+
+async def _show_pitch(target: Message, user_id: int, *, prev_feed_idx: int,
+                      edit: bool) -> None:
+    """Завершающий «продающий» экран после ленты новостей."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        # featured-курс из настроек, иначе самый свежий опубликованный
+        featured_id_raw = await setting_get("featured_course_id", "")
+        course = None
+        if featured_id_raw and featured_id_raw.isdigit():
+            course = await (await conn.execute(
+                "SELECT * FROM courses WHERE id = ? AND is_published = 1",
+                (int(featured_id_raw),),
+            )).fetchone()
+        if not course:
+            course = await (await conn.execute(
+                "SELECT * FROM courses WHERE is_published = 1 "
+                "ORDER BY id DESC LIMIT 1"
+            )).fetchone()
+        owned = False
+        if course:
+            owned = bool(await (await conn.execute(
+                "SELECT 1 FROM purchases WHERE user_id = ? AND course_id = ?",
+                (user_id, course["id"]),
+            )).fetchone())
+
+    is_admin_user = is_admin(user_id)
+    b = InlineKeyboardBuilder()
+
+    if course:
+        cid = int(course["id"])
+        if owned:
+            b.button(text="🎓 Открыть курс", callback_data=f"course:{cid}")
+        else:
+            b.button(text="✨ Интересно",
+                     callback_data=f"buy:{cid}")
+        b.button(text="📚 Все курсы", callback_data="catalog:0")
+        b.button(text="◀️ Назад к новостям", callback_data=f"feed:{prev_feed_idx}")
+        b.button(text="🎓 Мои курсы", callback_data="my_courses")
+        b.button(text="🎁 Реф. программа", callback_data="ref")
+        if is_admin_user:
+            b.button(text="🛠 Админ-панель", callback_data="admin:menu")
+        b.adjust(1, 2, 2, 1)
+
+        title = course["title"]
+        short = course["short_description"] or ""
+        desc = course["description"] or ""
+        price_line = (
+            f"🎓 Уже куплено — открывайте уроки!" if owned
+            else f"💵 Стоимость: <b>{rub(course['price'])}</b>"
+        )
+        text = (
+            f"<b>🌟 Самый востребованный курс</b>\n\n"
+            f"<b>{esc(title)}</b>\n"
+            f"{esc(short)}\n\n"
+            f"{esc(desc)[:600]}"
+            f"{'…' if len(desc) > 600 else ''}\n\n"
+            f"{price_line}"
+        ).strip()
+        cover_type = course["cover_type"]
+        cover_fid = course["cover_file_id"]
+    else:
+        # курсов вообще нет — fallback
+        b.button(text="📚 Каталог", callback_data="catalog:0")
+        b.button(text="◀️ Назад к новостям", callback_data=f"feed:{prev_feed_idx}")
+        if is_admin_user:
+            b.button(text="🛠 Админ-панель", callback_data="admin:menu")
+        b.adjust(1)
+        text = "✨ Курсы скоро появятся. Загляните позже!"
+        cover_type = None
+        cover_fid = None
+
+    kb = b.as_markup()
+
+    # такой же приём, как в _show_feed: не пытаемся edit_text при наличии медиа
+    if edit and not (cover_type and cover_fid):
+        with suppress(TelegramAPIError):
+            await target.edit_text(text, reply_markup=kb)
+            return
+    if edit:
+        with suppress(TelegramAPIError):
+            await target.delete()
+
+    caption = text[:1024]
+    try:
+        if cover_type == "photo" and cover_fid:
+            await bot.send_photo(user_id, cover_fid, caption=caption, reply_markup=kb)
+        elif cover_type == "video" and cover_fid:
+            await bot.send_video(user_id, cover_fid, caption=caption, reply_markup=kb)
+        elif cover_type == "animation" and cover_fid:
+            await bot.send_animation(user_id, cover_fid, caption=caption, reply_markup=kb)
+        else:
+            await bot.send_message(user_id, text, reply_markup=kb)
+    except TelegramAPIError as e:
+        log.warning("pitch render failed: %s", e)
+        with suppress(TelegramAPIError):
+            await bot.send_message(user_id, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "noop")
@@ -1162,7 +1391,7 @@ async def cb_course_view(c: CallbackQuery) -> None:
         if lessons and len(progress_set) >= len(lessons):
             action.button(text="🏆 Сертификат (PDF)", callback_data=f"cert:{cid}")
     else:
-        action.button(text=f"🛒 Купить за {rub(course['price'])}", callback_data=f"buy:{cid}")
+        action.button(text="✨ Интересно", callback_data=f"buy:{cid}")
     action.button(text="⬅️ В каталог", callback_data="catalog:0")
     action.adjust(1)
     b.attach(action)
