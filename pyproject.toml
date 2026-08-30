@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-shop-bot"
+version = "0.1.0"
+description = "Public Telegram digital goods marketplace bot (aiogram 3.26.0)"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram==3.26.0",
+    "python-dotenv>=1.0.1",
+    "aiohttp>=3.9.0",
+    "aiosqlite>=0.20.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[tool.setuptools]
+py-modules = ["bot", "app"]
